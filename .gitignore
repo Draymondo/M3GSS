@@ -1,0 +1,39 @@
+﻿# =========================
+# M3GSS - Git Ignore
+# =========================
+
+# CMake / Visual Studio
+build/
+Testing/
+.vs/
+
+# Python
+ml/.venv/
+__pycache__/
+*.py[cod]
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+
+# Machine / IDE
+.vscode/
+*.user
+*.suo
+
+# Generated ML artifacts
+ml/checkpoints/
+ml/data/
+
+# Generated comparison / test outputs
+comparison/*.png
+
+# Local test images and generated results
+test_re9.jpg
+test_re9_copy.jpg
+test_re9_baseline.png
+
+# Logs / temporary files
+*.log
+*.tmp
+*.temp
