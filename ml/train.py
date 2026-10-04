@@ -19,12 +19,110 @@ ROOT = Path(__file__).resolve().parent
 DIV2K = Path(r"D:\M3GSS_OFFLINE\datasets\DIV2K\train_HR")
 FLICKR2K = Path(r"D:\M3GSS_OFFLINE\datasets\Flickr2K\HR\Flickr2K")
 
-DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "m3gss_v0_big_latest.pt"
-DEFAULT_BEST = ROOT / "checkpoints" / "m3gss_v0_big_best.pt"
+# Noms V1 : un run V1 ne doit jamais ecraser un checkpoint V0.
+DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "m3gss_v1_big_latest.pt"
+DEFAULT_BEST = ROOT / "checkpoints" / "m3gss_v1_big_best.pt"
 
 PATCH_SIZE = 96
 SCALE = 2
 SAVE_EVERY = 500
+
+# ---------------------------------------------------------------------------
+# Pertes M3GSS V1 -- constantes faciles a modifier
+# ---------------------------------------------------------------------------
+CHARBONNIER_EPS = 1e-3   # stabilise sqrt(...) autour de 0 (valeur usuelle en SR)
+EDGE_WEIGHT = 0.1         # poids faible : la loss reste principalement fidele
+LOSS_VERSION = "v1_charbonnier_edge"
+
+
+class CharbonnierLoss(nn.Module):
+    """Charbonnier : sqrt((pred - target)^2 + eps^2), differentiable partout."""
+
+    def __init__(
+        self,
+        eps: float = CHARBONNIER_EPS,
+    ) -> None:
+
+        super().__init__()
+
+        self.eps_sq = float(eps) ** 2
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+
+        diff = prediction - target
+
+        return torch.sqrt(
+            diff * diff + self.eps_sq
+        ).mean()
+
+
+class EdgeGradientLoss(nn.Module):
+    """L1 sur les gradients horizontaux et verticaux (differences finies).
+
+    Les bords sont ignores (tranches 1:) : pas de bord torique, aucune
+    dependance, differentiable et rapide sur CPU comme sur CUDA.
+    """
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+
+        if (
+            prediction.shape[-2] < 2
+            or prediction.shape[-1] < 2
+        ):
+
+            return (
+                prediction - target
+            ).abs().mean() * 0.0
+
+        pred_gx = prediction[..., :, 1:] - prediction[..., :, :-1]
+        pred_gy = prediction[..., 1:, :] - prediction[..., :-1, :]
+
+        targ_gx = target[..., :, 1:] - target[..., :, :-1]
+        targ_gy = target[..., 1:, :] - target[..., :-1, :]
+
+        return (
+            (pred_gx - targ_gx).abs().mean()
+            + (pred_gy - targ_gy).abs().mean()
+        )
+
+
+class M3GSSV1Loss(nn.Module):
+    """Loss V1 : Charbonnier + EDGE_WEIGHT * Edge/Gradient.
+
+    Retourne (total, charbonnier, edge) pour l'affichage et le suivi.
+    """
+
+    def __init__(
+        self,
+        eps: float = CHARBONNIER_EPS,
+        edge_weight: float = EDGE_WEIGHT,
+    ) -> None:
+
+        super().__init__()
+
+        self.charbonnier = CharbonnierLoss(eps)
+        self.edge = EdgeGradientLoss()
+        self.edge_weight = edge_weight
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+    ):
+
+        charbonnier = self.charbonnier(prediction, target)
+        edge = self.edge(prediction, target)
+        total = charbonnier + self.edge_weight * edge
+
+        return total, charbonnier, edge
 
 
 def set_seed(seed: int) -> None:
@@ -118,6 +216,9 @@ def save_checkpoint(
             "patch_size": PATCH_SIZE,
             "scale": SCALE,
             "dataset": "DIV2K_train_HR + Flickr2K_HR",
+            "loss_version": LOSS_VERSION,
+            "charbonnier_eps": CHARBONNIER_EPS,
+            "edge_weight": EDGE_WEIGHT,
         },
         path,
     )
@@ -160,7 +261,7 @@ def load_checkpoint(
 def main() -> int:
 
     parser = argparse.ArgumentParser(
-        description="M3GSS v0 - gros entrainement DIV2K + Flickr2K"
+        description="M3GSS V1 - gros entrainement DIV2K + Flickr2K (Charbonnier + Edge)"
     )
 
     parser.add_argument(
@@ -237,7 +338,7 @@ def main() -> int:
 
     device = torch.device("cuda")
 
-    print("=== M3GSS v0 - GROS ENTRAINEMENT ===")
+    print("=== M3GSS V1 - GROS ENTRAINEMENT ===")
     print()
     print(f"DIV2K images    : {len(div2k_paths)}")
     print(f"Flickr2K images : {len(flickr2k_paths)}")
@@ -254,6 +355,9 @@ def main() -> int:
     print(f"Steps           : {args.steps}")
     print(f"Batch           : {args.batch_size}")
     print(f"Learning rate   : {args.lr}")
+    print(f"Loss            : {LOSS_VERSION}")
+    print(f"Charbonnier eps : {CHARBONNIER_EPS}")
+    print(f"Edge weight     : {EDGE_WEIGHT}")
     print()
 
     model = M3GSS_v0_32x8().to(device)
@@ -263,7 +367,7 @@ def main() -> int:
         lr=args.lr,
     )
 
-    criterion = nn.L1Loss()
+    criterion = M3GSSV1Loss()
 
     start_step = 0
     resume_seed = args.seed
@@ -304,6 +408,8 @@ def main() -> int:
     start = time.perf_counter()
 
     running_loss = 0.0
+    running_charbonnier = 0.0
+    running_edge = 0.0
     loss_count = 0
 
     model.train()
@@ -335,7 +441,7 @@ def main() -> int:
 
         output = model(bicubic)
 
-        loss = criterion(
+        loss, charbonnier_t, edge_t = criterion(
             output,
             target,
         )
@@ -347,8 +453,16 @@ def main() -> int:
         loss_value = float(
             loss.detach()
         )
+        charbonnier_value = float(
+            charbonnier_t.detach()
+        )
+        edge_value = float(
+            edge_t.detach()
+        )
 
         running_loss += loss_value
+        running_charbonnier += charbonnier_value
+        running_edge += edge_value
         loss_count += 1
 
         if (
@@ -372,7 +486,9 @@ def main() -> int:
 
             print(
                 f"step {step:5d}/{args.steps} | "
-                f"L1 {loss_value:.6f} | "
+                f"Charbonnier {charbonnier_value:.6f} | "
+                f"Edge {edge_value:.6f} | "
+                f"Total {loss_value:.6f} | "
                 f"{steps_per_sec:.2f} step/s"
             )
 
@@ -405,6 +521,14 @@ def main() -> int:
         running_loss / loss_count
     )
 
+    final_charbonnier = (
+        running_charbonnier / loss_count
+    )
+
+    final_edge = (
+        running_edge / loss_count
+    )
+
     save_checkpoint(
         checkpoint,
         model,
@@ -426,6 +550,7 @@ def main() -> int:
             "patch_size": PATCH_SIZE,
             "scale": SCALE,
             "dataset": "DIV2K_train_HR + Flickr2K_HR",
+            "loss_version": LOSS_VERSION,
         },
         best_path,
     )
@@ -437,7 +562,9 @@ def main() -> int:
 
     print()
     print("=== GROS ENTRAINEMENT TERMINE ===")
-    print(f"Loss moyenne : {final_loss:.6f}")
+    print(f"Charbonnier    : {final_charbonnier:.6f}")
+    print(f"Edge/Gradient  : {final_edge:.6f}")
+    print(f"Loss totale    : {final_loss:.6f}")
     print(f"Temps total  : {elapsed:.2f} s")
     print(
         f"Vitesse      : "
