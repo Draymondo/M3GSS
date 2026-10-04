@@ -1,328 +1,452 @@
-"""M3GSS v0 — entrainement. ETAPE 4 : SMOKE TEST controle uniquement.
-
-Commande :
-
-    .\\.venv\\Scripts\\python.exe train.py --smoke-test
-
-Objectif : prouver que la chaine complete fonctionne REELLEMENT :
-
-    HR -> LR (area x2) -> bicubique Catmull-Rom -> M3GSS -> L1
-        -> backward -> Adam -> mise a jour des poids
-
-Contraintes respectees : CPU uniquement, aucun GPU requis, aucun
-telechargement, aucun dataset externe, batch 1-2, ~10-20 steps.
-L'entrainement reel (DIV2K / Flickr2K) n'est PAS implemente.
-"""
-
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
-import math
 import random
 import time
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+from PIL import Image
 
+from m3gss_v0.bicubic import area_downscale, catmull_rom_upscale
 from m3gss_v0.model import M3GSS_v0_32x8, count_parameters
-from m3gss_v0.synthetic import TrainingSample, build_smoke_dataset
-
-__all__ = [
-    "SmokeConfig",
-    "SmokeResult",
-    "set_seed",
-    "compute_psnr",
-    "run_smoke_test",
-    "save_checkpoint",
-    "load_checkpoint",
-    "main",
-]
-
-CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "smoke_test.pt"
 
 
-@dataclass
-class SmokeConfig:
-    """Configuration du smoke test (toute petite, pour CPU)."""
+ROOT = Path(__file__).resolve().parent
 
-    seed: int = 1234
-    steps: int = 15
-    batch_size: int = 1
-    lr: float = 1e-4
-    num_images: int = 4
-    samples_per_image: int = 2
-    patch_size: int = 96
-    base_size: int = 192
+DIV2K = Path(r"D:\M3GSS_OFFLINE\datasets\DIV2K\train_HR")
+FLICKR2K = Path(r"D:\M3GSS_OFFLINE\datasets\Flickr2K\HR\Flickr2K")
 
+DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "m3gss_v0_big_latest.pt"
+DEFAULT_BEST = ROOT / "checkpoints" / "m3gss_v0_big_best.pt"
 
-@dataclass
-class SmokeResult:
-    steps: list = field(default_factory=list)
-    losses: list = field(default_factory=list)
-    residual_max: list = field(default_factory=list)
-    grad_norms: list = field(default_factory=list)
-    initial_loss: float = 0.0
-    final_loss: float = 0.0
-    loss_delta: float = 0.0
-    modified_parameters: int = 0
-    total_parameters: int = 0
-    total_parameter_tensors: int = 0
-    val_psnr_before: float = 0.0
-    val_psnr_after: float = 0.0
-    elapsed_seconds: float = 0.0
-    checkpoint: str = ""
+PATCH_SIZE = 96
+SCALE = 2
+SAVE_EVERY = 500
 
 
 def set_seed(seed: int) -> None:
-    """Seed fixe pour Python, NumPy et PyTorch -> reproductibilite totale."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(False)
 
 
-def compute_psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
-    """PSNR en dB sur des tenseurs normalises [0,1] (MAX = 1.0)."""
-    diff = pred.detach().double() - target.detach().double()
-    mse = float(torch.mean(diff * diff))
-    if mse <= 0.0:
-        return float("inf")
-    return 10.0 * math.log10(1.0 / mse)
+def load_image(path: Path) -> np.ndarray:
+    with Image.open(path) as img:
+        return np.asarray(img.convert("RGB"), dtype=np.uint8)
 
 
-def _batch_from(samples, indices) -> tuple[torch.Tensor, torch.Tensor]:
-    bicubic = torch.stack([samples[i].bicubic for i in indices], dim=0)
-    target = torch.stack([samples[i].target for i in indices], dim=0)
-    return bicubic, target
+def make_training_pair(
+    image: np.ndarray,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    h, w = image.shape[:2]
+
+    if h < PATCH_SIZE or w < PATCH_SIZE:
+        raise ValueError(f"Image trop petite: {image.shape}")
+
+    x = rng.randint(0, w - PATCH_SIZE)
+    y = rng.randint(0, h - PATCH_SIZE)
+
+    hr = image[y:y + PATCH_SIZE, x:x + PATCH_SIZE]
+
+    lr_w = PATCH_SIZE // SCALE
+    lr_h = PATCH_SIZE // SCALE
+
+    lr = area_downscale(hr, lr_w, lr_h)
+    bicubic = catmull_rom_upscale(lr, PATCH_SIZE, PATCH_SIZE)
+
+    bicubic_t = torch.from_numpy(
+        np.ascontiguousarray(bicubic)
+    ).permute(2, 0, 1).float() / 255.0
+
+    hr_t = torch.from_numpy(
+        np.ascontiguousarray(hr)
+    ).permute(2, 0, 1).float() / 255.0
+
+    return bicubic_t, hr_t
 
 
-def _grad_norm(model: nn.Module) -> float:
-    total = 0.0
-    for param in model.parameters():
-        if param.grad is not None:
-            total += float(param.grad.detach().double().pow(2).sum())
-    return math.sqrt(total)
+def make_batch(
+    paths: list[Path],
+    batch_size: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor]:
 
+    inputs = []
+    targets = []
 
-def _validate_pre_step(model: nn.Module, bicubic: torch.Tensor) -> float:
-    """GARDE-FOU AVANT le premier optimizer.step().
+    for _ in range(batch_size):
+        path = paths[rng.randrange(len(paths))]
+        image = load_image(path)
 
-    Avec tail zero-init, la sortie doit etre strictement identique au bicubique
-    et le residu strictement nul. Cela detecte une erreur d'architecture.
-    """
-    with torch.no_grad():
-        out = model(bicubic)
-        residual = model.predict_residual(bicubic)
-
-    if not torch.equal(out, bicubic):
-        raise RuntimeError(
-            "GARDE-FOU : la sortie differe du bicubique avant entrainement "
-            f"(ecart max {float((out - bicubic).abs().max()):.6e})"
+        inp, target = make_training_pair(
+            image,
+            rng,
         )
-    if float(residual.abs().max()) != 0.0:
-        raise RuntimeError(
-            "GARDE-FOU : le residu initial n'est pas nul "
-            f"({float(residual.abs().max()):.6e})"
-        )
-    return float(residual.abs().max())
+
+        inputs.append(inp)
+        targets.append(target)
+
+    return torch.stack(inputs), torch.stack(targets)
 
 
-def _validate_post_step(model, snapshot, bicubic, loss_value) -> float:
-    """GARDE-FOU APRES le premier optimizer.step().
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    loss: float,
+    seed: int,
+) -> None:
 
-    Les parametres doivent avoir reellement change, le residu ne doit plus
-    etre nul, et la loss doit etre finie.
-    On n'exige PAS que la loss diminue.
-    """
-    changed = sum(
-        1
-        for name, param in model.named_parameters()
-        if not torch.equal(param.detach(), snapshot[name])
-    )
-    if changed == 0:
-        raise RuntimeError(
-            "GARDE-FOU : aucun parametre n'a change apres optimizer.step()"
-        )
-    if not math.isfinite(loss_value):
-        raise RuntimeError(f"GARDE-FOU : loss non finie ({loss_value})")
-
-    with torch.no_grad():
-        residual_max = float(model.predict_residual(bicubic).abs().max())
-    if residual_max == 0.0:
-        raise RuntimeError(
-            "GARDE-FOU : le residu est encore nul apres une mise a jour des poids"
-        )
-    return residual_max
-
-
-def run_smoke_test(cfg: SmokeConfig, checkpoint_path: Path | None = None) -> SmokeResult:
-    """Execute le smoke test complet et renvoie toutes les mesures."""
-    start = time.perf_counter()
-    set_seed(cfg.seed)
-
-    train_samples = build_smoke_dataset(
-        num_images=cfg.num_images,
-        samples_per_image=cfg.samples_per_image,
-        patch_size=cfg.patch_size,
-        base_size=cfg.base_size,
-        seed=cfg.seed,
-        image_offset=0,
-    )
-    # Validation synthetique DISJOINTE (images d'index differents)
-    val_samples = build_smoke_dataset(
-        num_images=1,
-        samples_per_image=1,
-        patch_size=cfg.patch_size,
-        base_size=cfg.base_size,
-        seed=cfg.seed + 1,
-        image_offset=50,
-    )
-    val_bicubic, val_target = _batch_from(val_samples, [0])
-
-    model = M3GSS_v0_32x8()
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    l1 = nn.L1Loss()
-
-    result = SmokeResult(
-        total_parameters=count_parameters(model),
-        total_parameter_tensors=len(list(model.named_parameters())),
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    first_bicubic, first_target = _batch_from(train_samples, [0])
-    _validate_pre_step(model, first_bicubic)
-    result.val_psnr_before = compute_psnr(model(val_bicubic), val_target)
-
-    snapshot = {n: p.detach().clone() for n, p in model.named_parameters()}
-
-    # NOTE zero-init : au 1er step, tail.poids est nul donc dL/d(merged) = 0 :
-    # le gradient ne traverse PAS les couches en amont et seul le tail bouge.
-    # Ce comportement est attendu (il vient du zero-init, pas d'un bug).
-    # Au 2e step, tail n'etant plus nul, le gradient se propage normalement.
-    n_train = len(train_samples)
-    for step in range(1, cfg.steps + 1):
-        indices = [
-            (step * cfg.batch_size + k) % n_train for k in range(cfg.batch_size)
-        ]
-        bicubic, target = _batch_from(train_samples, indices)
-
-        out = model(bicubic)
-        loss = l1(out, target)
-
-        optimizer.zero_grad()
-        loss.backward()
-        grad_norm = _grad_norm(model)
-        optimizer.step()
-
-        with torch.no_grad():
-            residual_max = float(model.predict_residual(bicubic).abs().max())
-
-        if step == 1:
-            residual_max = _validate_post_step(model, snapshot, bicubic, float(loss.detach()))
-            result.initial_loss = float(loss.detach())
-
-        result.steps.append(step)
-        result.losses.append(float(loss.detach()))
-        result.residual_max.append(residual_max)
-        result.grad_norms.append(grad_norm)
-
-        print(
-            f"step {step:3d}/{cfg.steps} | "
-            f"L1 {float(loss.detach()):.6f} | "
-            f"residu max {residual_max:.6e} | "
-            f"grad norm {grad_norm:.6e}"
-        )
-
-    result.final_loss = result.losses[-1]
-    result.loss_delta = result.final_loss - result.initial_loss
-    result.modified_parameters = sum(
-        1
-        for name, param in model.named_parameters()
-        if not torch.equal(param.detach(), snapshot[name])
-    )
-
-    with torch.no_grad():
-        result.val_psnr_after = compute_psnr(model(val_bicubic), val_target)
-
-    if checkpoint_path is not None:
-        save_checkpoint(
-            checkpoint_path, model, optimizer, cfg, result.final_loss, len(result.steps)
-        )
-        result.checkpoint = str(checkpoint_path)
-
-    result.elapsed_seconds = time.perf_counter() - start
-    return result
-
-
-def save_checkpoint(path, model, optimizer, cfg, final_loss, step) -> None:
-    """Sauvegarde le checkpoint final (dossier cree automatiquement)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "step": step,
-            "seed": cfg.seed,
-            "config": asdict(cfg),
-            "final_loss": final_loss,
+            "loss": loss,
+            "seed": seed,
+            "patch_size": PATCH_SIZE,
+            "scale": SCALE,
+            "dataset": "DIV2K_train_HR + Flickr2K_HR",
         },
         path,
     )
 
 
-def load_checkpoint(path):
-    """Recharge un checkpoint sur CPU."""
-    return torch.load(Path(path), map_location="cpu", weights_only=False)
+def load_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[int, float, int]:
+
+    print(f"Chargement du checkpoint : {path}")
+
+    checkpoint = torch.load(
+        path,
+        map_location=device,
+        weights_only=True,
+    )
+
+    model.load_state_dict(
+        checkpoint["state_dict"]
+    )
+
+    optimizer.load_state_dict(
+        checkpoint["optimizer_state_dict"]
+    )
+
+    step = int(checkpoint["step"])
+    loss = float(checkpoint["loss"])
+    seed = int(checkpoint.get("seed", 1234))
+
+    print(f"Reprise a l'etape : {step}")
+    print(f"Derniere loss      : {loss:.6f}")
+    print()
+
+    return step, loss, seed
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="M3GSS v0 - entrainement")
-    parser.add_argument(
-        "--smoke-test",
-        action="store_true",
-        help="smoke test CPU sur donnees synthetiques (seul mode implemente)",
+
+    parser = argparse.ArgumentParser(
+        description="M3GSS v0 - gros entrainement DIV2K + Flickr2K"
     )
-    parser.add_argument("--steps", type=int, default=15)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--checkpoint", type=str, default=str(CHECKPOINT_PATH))
+
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=5000,
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+    )
+
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+    )
+
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+    )
+
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=str(DEFAULT_CHECKPOINT),
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+    )
+
     args = parser.parse_args()
 
-    if not args.smoke_test:
-        print(
-            "Aucun entrainement reel n'est implemente.\n"
-            "Utilisez :  python train.py --smoke-test"
+    if not DIV2K.exists():
+        raise FileNotFoundError(
+            f"Dataset DIV2K introuvable : {DIV2K}"
         )
-        return 2
 
-    cfg = SmokeConfig(
-        seed=args.seed,
-        steps=args.steps,
-        batch_size=args.batch_size,
+    if not FLICKR2K.exists():
+        raise FileNotFoundError(
+            f"Dataset Flickr2K introuvable : {FLICKR2K}"
+        )
+
+    div2k_paths = sorted(
+        DIV2K.rglob("*.png")
+    )
+
+    flickr2k_paths = sorted(
+        FLICKR2K.rglob("*.png")
+    )
+
+    if not div2k_paths:
+        raise RuntimeError(
+            f"Aucune image PNG dans {DIV2K}"
+        )
+
+    if not flickr2k_paths:
+        raise RuntimeError(
+            f"Aucune image PNG dans {FLICKR2K}"
+        )
+
+    paths = div2k_paths + flickr2k_paths
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA n'est pas disponible."
+        )
+
+    device = torch.device("cuda")
+
+    print("=== M3GSS v0 - GROS ENTRAINEMENT ===")
+    print()
+    print(f"DIV2K images    : {len(div2k_paths)}")
+    print(f"Flickr2K images : {len(flickr2k_paths)}")
+    print(f"Total images    : {len(paths)}")
+    print()
+    print(f"GPU             : {torch.cuda.get_device_name(0)}")
+    print(f"PyTorch         : {torch.__version__}")
+    print(f"CUDA            : {torch.version.cuda}")
+    print(f"Patch HR        : {PATCH_SIZE}x{PATCH_SIZE}")
+    print(
+        f"Patch LR        : "
+        f"{PATCH_SIZE // SCALE}x{PATCH_SIZE // SCALE}"
+    )
+    print(f"Steps           : {args.steps}")
+    print(f"Batch           : {args.batch_size}")
+    print(f"Learning rate   : {args.lr}")
+    print()
+
+    model = M3GSS_v0_32x8().to(device)
+
+    optimizer = torch.optim.Adam(
+        model.parameters(),
         lr=args.lr,
     )
 
-    print("=== M3GSS v0 - SMOKE TEST (CPU, donnees synthetiques) ===")
-    print(f"config : {asdict(cfg)}")
+    criterion = nn.L1Loss()
+
+    start_step = 0
+    resume_seed = args.seed
+
+    checkpoint = Path(args.checkpoint)
+
+    if args.resume:
+        if not checkpoint.exists():
+            raise FileNotFoundError(
+                f"Checkpoint introuvable : {checkpoint}"
+            )
+
+        start_step, _, resume_seed = load_checkpoint(
+            checkpoint,
+            model,
+            optimizer,
+            device,
+        )
+
+        rng = random.Random(resume_seed)
+
+    else:
+        rng = random.Random(args.seed)
+
+    print(f"Parametres      : {count_parameters(model):,}")
+    print(
+        f"Debut effectif  : "
+        f"{start_step + 1}"
+    )
+    print(
+        f"Fin demandee    : "
+        f"{args.steps}"
+    )
+    print()
+    print("Demarrage...")
     print()
 
-    result = run_smoke_test(cfg, Path(args.checkpoint))
+    start = time.perf_counter()
+
+    running_loss = 0.0
+    loss_count = 0
+
+    model.train()
+
+    for step in range(
+        start_step + 1,
+        args.steps + 1,
+    ):
+
+        bicubic, target = make_batch(
+            paths,
+            args.batch_size,
+            rng,
+        )
+
+        bicubic = bicubic.to(
+            device,
+            non_blocking=True,
+        )
+
+        target = target.to(
+            device,
+            non_blocking=True,
+        )
+
+        optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        output = model(bicubic)
+
+        loss = criterion(
+            output,
+            target,
+        )
+
+        loss.backward()
+
+        optimizer.step()
+
+        loss_value = float(
+            loss.detach()
+        )
+
+        running_loss += loss_value
+        loss_count += 1
+
+        if (
+            step == start_step + 1
+            or step % 25 == 0
+            or step == args.steps
+        ):
+
+            elapsed = (
+                time.perf_counter()
+                - start
+            )
+
+            current_steps = (
+                step - start_step
+            )
+
+            steps_per_sec = (
+                current_steps / elapsed
+            )
+
+            print(
+                f"step {step:5d}/{args.steps} | "
+                f"L1 {loss_value:.6f} | "
+                f"{steps_per_sec:.2f} step/s"
+            )
+
+        if step % SAVE_EVERY == 0:
+
+            checkpoint_loss = (
+                running_loss / loss_count
+            )
+
+            save_checkpoint(
+                checkpoint,
+                model,
+                optimizer,
+                step,
+                checkpoint_loss,
+                resume_seed,
+            )
+
+            print(
+                f"  -> checkpoint sauvegarde : "
+                f"step {step}"
+            )
+
+    elapsed = (
+        time.perf_counter()
+        - start
+    )
+
+    final_loss = (
+        running_loss / loss_count
+    )
+
+    save_checkpoint(
+        checkpoint,
+        model,
+        optimizer,
+        args.steps,
+        final_loss,
+        resume_seed,
+    )
+
+    best_path = Path(
+        DEFAULT_BEST
+    )
+
+    torch.save(
+        {
+            "state_dict": model.state_dict(),
+            "step": args.steps,
+            "loss": final_loss,
+            "patch_size": PATCH_SIZE,
+            "scale": SCALE,
+            "dataset": "DIV2K_train_HR + Flickr2K_HR",
+        },
+        best_path,
+    )
+
+    peak_vram = (
+        torch.cuda.max_memory_allocated()
+        / (1024 ** 2)
+    )
 
     print()
-    print("=== Bilan ===")
-    print(f"loss initiale        : {result.initial_loss:.6f}")
-    print(f"loss finale          : {result.final_loss:.6f}")
-    print(f"variation loss       : {result.loss_delta:+.6f}")
-    print(f"parametres modifies  : {result.modified_parameters}/{result.total_parameter_tensors} tenseurs ({result.total_parameters} elements)")
+    print("=== GROS ENTRAINEMENT TERMINE ===")
+    print(f"Loss moyenne : {final_loss:.6f}")
+    print(f"Temps total  : {elapsed:.2f} s")
+    print(
+        f"Vitesse      : "
+        f"{(args.steps - start_step) / elapsed:.2f} step/s"
+    )
+    print(f"VRAM max     : {peak_vram:.1f} MiB")
+    print(f"Checkpoint   : {checkpoint}")
+    print(f"Modele final : {best_path}")
 
-    print(f"PSNR val avant       : {result.val_psnr_before:.4f} dB")
-    print(f"PSNR val apres       : {result.val_psnr_after:.4f} dB")
-    print(f"temps total          : {result.elapsed_seconds:.3f} s")
-    print(f"checkpoint           : {result.checkpoint}")
     return 0
 
 
