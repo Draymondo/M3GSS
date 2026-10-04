@@ -3,6 +3,7 @@
 import argparse
 import random
 import time
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -131,8 +132,20 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
-def load_image(path: Path) -> np.ndarray:
-    with Image.open(path) as img:
+def load_image(
+    source: Path | tuple[Path, str],
+    zip_file: zipfile.ZipFile | None = None,
+) -> np.ndarray:
+    """Charge une image depuis un fichier PNG ou directement depuis un ZIP."""
+    if isinstance(source, tuple):
+        if zip_file is None:
+            raise RuntimeError("Lecteur ZIP Flickr2K manquant.")
+        zip_path, member = source
+        with zip_file.open(member) as fp:
+            with Image.open(fp) as img:
+                return np.asarray(img.convert("RGB"), dtype=np.uint8)
+
+    with Image.open(source) as img:
         return np.asarray(img.convert("RGB"), dtype=np.uint8)
 
 
@@ -169,9 +182,10 @@ def make_training_pair(
 
 
 def make_batch(
-    paths: list[Path],
+    paths: list[Path | tuple[Path, str]],
     batch_size: int,
     rng: random.Random,
+    zip_file: zipfile.ZipFile | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
     inputs = []
@@ -179,7 +193,7 @@ def make_batch(
 
     for _ in range(batch_size):
         path = paths[rng.randrange(len(paths))]
-        image = load_image(path)
+        image = load_image(path, zip_file)
 
         inp, target = make_training_pair(
             image,
@@ -289,6 +303,27 @@ def main() -> int:
     )
 
     parser.add_argument(
+        "--div2k",
+        type=str,
+        default=str(DIV2K),
+        help="Dossier DIV2K contenant les PNG d'entrainement.",
+    )
+
+    parser.add_argument(
+        "--flickr2k",
+        type=str,
+        default=str(FLICKR2K),
+        help="Dossier Flickr2K contenant les PNG d'entrainement.",
+    )
+
+    parser.add_argument(
+        "--flickr2k-zip",
+        type=str,
+        default=None,
+        help="Archive Flickr2K.zip a lire directement sans extraction.",
+    )
+
+    parser.add_argument(
         "--checkpoint",
         type=str,
         default=str(DEFAULT_CHECKPOINT),
@@ -301,33 +336,58 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if not DIV2K.exists():
+    div2k_root = Path(args.div2k)
+    flickr2k_root = Path(args.flickr2k)
+    flickr2k_zip_path = (
+        Path(args.flickr2k_zip)
+        if args.flickr2k_zip
+        else None
+    )
+
+    if not div2k_root.exists():
         raise FileNotFoundError(
-            f"Dataset DIV2K introuvable : {DIV2K}"
+            f"Dataset DIV2K introuvable : {div2k_root}"
         )
 
-    if not FLICKR2K.exists():
+    if flickr2k_zip_path is None and not flickr2k_root.exists():
         raise FileNotFoundError(
-            f"Dataset Flickr2K introuvable : {FLICKR2K}"
+            f"Dataset Flickr2K introuvable : {flickr2k_root}"
         )
 
     div2k_paths = sorted(
-        DIV2K.rglob("*.png")
+        div2k_root.rglob("*.png")
     )
 
-    flickr2k_paths = sorted(
-        FLICKR2K.rglob("*.png")
-    )
+    if flickr2k_zip_path is not None:
+        if not flickr2k_zip_path.exists():
+            raise FileNotFoundError(
+                f"Archive Flickr2K introuvable : {flickr2k_zip_path}"
+            )
 
-    if not div2k_paths:
-        raise RuntimeError(
-            f"Aucune image PNG dans {DIV2K}"
+        with zipfile.ZipFile(flickr2k_zip_path, "r") as zf:
+            flickr2k_members = sorted(
+                name for name in zf.namelist()
+                if name.lower().endswith(".png")
+            )
+
+        if not flickr2k_members:
+            raise RuntimeError(
+                f"Aucune image PNG dans {flickr2k_zip_path}"
+            )
+
+        flickr2k_paths = [
+            (flickr2k_zip_path, member)
+            for member in flickr2k_members
+        ]
+    else:
+        flickr2k_paths = sorted(
+            flickr2k_root.rglob("*.png")
         )
 
-    if not flickr2k_paths:
-        raise RuntimeError(
-            f"Aucune image PNG dans {FLICKR2K}"
-        )
+        if not flickr2k_paths:
+            raise RuntimeError(
+                f"Aucune image PNG dans {flickr2k_root}"
+            )
 
     paths = div2k_paths + flickr2k_paths
 
@@ -405,6 +465,12 @@ def main() -> int:
     print("Demarrage...")
     print()
 
+    flickr_zip_file = (
+        zipfile.ZipFile(flickr2k_zip_path, "r")
+        if flickr2k_zip_path is not None
+        else None
+    )
+
     start = time.perf_counter()
 
     running_loss = 0.0
@@ -423,6 +489,7 @@ def main() -> int:
             paths,
             args.batch_size,
             rng,
+            flickr_zip_file,
         )
 
         bicubic = bicubic.to(
@@ -528,6 +595,9 @@ def main() -> int:
     final_edge = (
         running_edge / loss_count
     )
+
+    if flickr_zip_file is not None:
+        flickr_zip_file.close()
 
     save_checkpoint(
         checkpoint,
