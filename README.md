@@ -194,6 +194,54 @@ Visual findings:
 
 ---
 
+## 5.1. Historical training chronology and clarified context
+
+The training history is important because the project went through more than one data-availability stage.
+
+### Stage A — initial DIV2K-only work
+The first local training work was started with **DIV2K train_HR (800 images)**. There was an earlier DIV2K-only run for which the captured output was incomplete; it should **not** be confused with the official V0 benchmark below.
+
+### Stage B — Flickr2K added locally
+After Flickr2K became available locally, the training pipeline was extended to use:
+
+- 800 DIV2K training images
+- 2,650 Flickr2K HR images
+- **3,450 training images total**
+
+This combined dataset is the dataset configuration associated with the official V0 training result recorded in this README:
+
+- 5,000 steps
+- batch 8
+- learning rate 1e-4
+- GTX 970
+- checkpoint names: `m3gss_v0_big_latest.pt` / `m3gss_v0_big_best.pt`
+- 5,708.28 s (~1 h 35 min)
+- 0.88 step/s.
+
+The important historical point is therefore:
+
+`DIV2K-only preparation → Flickr2K added → combined 3,450-image training → V0 validation → V1 loss experiment`
+
+There is **no reliable evidence in the recovered project history for treating the earlier incomplete DIV2K-only run as the official V0 result**.
+
+### Stage C — V1
+V1 kept the same lightweight architecture and combined 3,450-image dataset while changing the loss to Charbonnier + edge gradient loss. The official local V1 result is the 5,000-step GTX 970 run documented in Section 6.
+
+### Stage D — Kaggle
+Kaggle was subsequently used as an additional experimentation environment. It reproduced the same 800 + 2,650 image dataset configuration, but the 5,000-step Kaggle run was interrupted by a session reset and is **not an official completed training result**.
+
+### Why this distinction matters
+Another AI agent should not infer that every mention of a 5,000-step run refers to the same experiment. The project contains:
+
+1. an early incomplete DIV2K-only run,
+2. the official combined-data V0 result,
+3. the official combined-data V1 result,
+4. an incomplete Kaggle experiment.
+
+Only the completed local GTX 970 V0/V1 results should currently be treated as established project benchmarks.
+
+---
+
 ## 6. V1 — Charbonnier + Edge/Gradient loss
 
 V1 keeps the **exact same neural architecture**. The training objective changed.
