@@ -4,7 +4,7 @@
 
 M3GSS is a personal, low-cost / zero-budget research project whose real objective is **not merely to maximize PSNR**: the final target is a useful **real-time image reconstruction/upscaling pipeline for games on a GTX 970 4 GB**, with practical GPU cost and no dependence on a cloud service at runtime.
 
-The project has completed its first offline model-validation phase and is now moving into **runtime architecture and game-integration engineering**.
+The project has completed its offline model-validation phase and is now moving into **runtime architecture and game-integration engineering**.
 
 ---
 
@@ -444,9 +444,9 @@ This confirmed that V2 training works on the **real 3,450-image dataset** and th
 
 ---
 
-## 10. Official V2 5,000-step training — IN PROGRESS
+## 10. Official V2 5,000-step training — COMPLETED
 
-The first full V2 training run has now been launched manually on ATMOS, rather than by Copilot.
+The first full V2 training run was completed manually on ATMOS.
 
 Command:
 
@@ -474,33 +474,57 @@ At launch, the run confirmed:
 - effective start: **1**
 - requested end: **5,000**
 
-Observed early training:
+Final result:
 
-| Step | Charbonnier | Edge | Total | Reported speed |
-|---:|---:|---:|---:|---:|
-| 1 | 0.016584 | 0.035944 | 0.020178 | 0.77 step/s |
-| 25 | 0.011006 | 0.024497 | 0.013456 | 0.84 step/s |
+- Charbonnier: **0.017050**
+- Edge/Gradient: **0.040965**
+- Total: **0.021147**
+- time: **5814.77 s** (~1 h 36 min 55 s)
+- speed: **0.86 step/s**
+- peak VRAM: **36.2 MiB**
+- checkpoint: `ml/checkpoints/m3gss_v2_latest.pt`
+- best checkpoint: `ml/checkpoints/m3gss_v2_best.pt`
 
-**Status: RUNNING / IN PROGRESS.**
+**Status: COMPLETED.**
 
-The machine can remain offline during this training because the dataset, code and Python environment are local on ATMOS.
+The machine remained offline during training; the dataset, code and Python environment were all local on ATMOS.
 
-Do not treat the final V2 quality or runtime as established until the 5,000-step run completes and the trained checkpoint is validated.
+The trained V2 checkpoint was subsequently verified with a strict architecture/state-dict load.
 
 ---
 
-## 11. Current project priority
+## 11. V2 quality validation — COMPLETED
+
+The trained V2 checkpoint was evaluated on **100 DIV2K validation images** against Catmull-Rom and the trained V1 reference.
+
+| Model | PSNR | SSIM |
+|---|---:|---:|
+| Catmull-Rom | 31.2474 dB | 0.899490 |
+| M3GSS V1 | **32.7649 dB** | **0.919723** |
+| M3GSS V2 | **32.5140 dB** | **0.917668** |
+
+- V1 gain vs Catmull-Rom: **+1.5176 dB**
+- V2 gain vs Catmull-Rom: **+1.2666 dB**
+- V2 vs V1: **−0.2509 dB**
+- visual comparisons: `ml/visual_results/v2_validation`
+
+Visual review found V1 superior on very fine microdetail, small text, wires and dense repeated geometry, while V2 produces cleaner/stabler contours with less ringing and oversharpening. V2's main weakness is selective smoothing of high-frequency textures.
+
+**Conclusion:** V1 remains the spatial-quality reference; V2 is the strategically important runtime candidate because of its much lower compute cost.
+
+---
+
+## 12. Current project priority
 
 The project is now explicitly in this order:
 
-1. **Complete the official V2 5,000-step training run.**
-2. Validate the trained V2 checkpoint.
-3. Measure V2 quality against bicubic and V1.
-4. Re-run the GTX 970 runtime benchmark with the trained V2.
-5. Build a continuous frame-processing loop.
-6. Introduce a real game/frame source.
-7. Test actual playable game performance on ATMOS.
-8. Only then iterate further on architecture or temporal reconstruction.
+1. **Benchmark the trained V2 checkpoint on GTX 970.**
+2. Build a controlled continuous frame-processing pipeline.
+3. Introduce a real video/frame source.
+4. Measure end-to-end latency/FPS, not model-only FPS.
+5. Move to a real game/frame source.
+6. Test actual playable game performance on ATMOS.
+7. Only then decide whether V2-Plus or temporal reconstruction is justified.
 
 The project must **not** drift into an endless training cycle.
 
@@ -599,7 +623,72 @@ ctest --test-dir build -C Release --output-on-failure
 
 ---
 
-## 15. Runtime scripts
+## 16. First real-time pipeline diagnostic — 2026-10-05
+
+Before creating the first continuous-frame prototype, the environment on ATMOS was audited.
+
+Confirmed runtime environment:
+
+- Python: `D:\M3GSS_OFFLINE\m3gss_gpu_env\Scripts\python.exe`
+- PyTorch: **2.14.1+cu126**
+- CUDA: **12.6**
+- GPU: **NVIDIA GeForce GTX 970**
+- CUDA available: **True**
+
+The V2 checkpoint was loaded in memory with `weights_only=True` and `strict=True` into `M3GSS_v2` successfully:
+
+- architecture: **M3GSS_v2**
+- training step: **5,000**
+- parameters: **50,148**
+
+### Video/capture dependency audit
+
+The GPU environment currently has **no video/capture backend installed**:
+
+- OpenCV (`cv2`): not installed
+- PyAV: not installed
+- imageio / imageio-ffmpeg: not installed
+- decord: not installed
+- mss: not installed
+- dxcam: not installed
+- torchvision: not installed
+- torchcodec: not installed
+- MoviePy: not installed
+- system `ffmpeg`: not available
+
+Available relevant building blocks are nevertheless sufficient for image-based inference:
+
+- `M3GSS_v2`
+- existing Catmull-Rom implementation
+- vectorized ×2 area downscale used by the V2 evaluator
+- existing image ↔ tensor conversion helpers
+- strict V2 checkpoint loading
+
+### Decision
+
+Do **not** install a new video dependency yet. The first end-to-end prototype will use a local **sequence of images** so that runtime measurements are not mixed with video-backend installation/debugging.
+
+Planned controlled pipeline:
+
+```
+960×540 image
+      ↓
+preprocessing
+      ↓
+Catmull-Rom 1920×1080 baseline
+      ↓
+M3GSS V2 — GTX 970
+      ↓
+1920×1080 reconstructed frame
+      ↓
+performance measurements
+```
+
+The first prototype must report preprocessing, Catmull-Rom, neural-network, postprocessing and total-frame latency, FPS, frame count and VRAM. This is a **controlled runtime prototype**, not yet the final game integration.
+
+---
+
+## 17. Runtime scripts
 
 The following experimental runtime scripts now exist in `ml/`:
 
@@ -613,7 +702,7 @@ These are measurement tools, not yet the final game runtime.
 
 ---
 
-## 16. Longer-term roadmap
+## 18. Longer-term roadmap
 
 ### V0 — Spatial baseline
 **Completed.**
@@ -642,7 +731,7 @@ Temporal reconstruction using previous-frame history, motion vectors and potenti
 
 ---
 
-## 17. Design principles / constraints
+## 19. Design principles / constraints
 
 M3GSS should remain:
 
@@ -667,7 +756,7 @@ Do not lose the main objective:
 
 ---
 
-## 18. Handoff for another AI agent
+## 20. Handoff for another AI agent
 
 If another AI assistant (Claude/Cline/Codex/etc.) takes over this repository, it should read this README **before making project decisions**.
 
@@ -681,20 +770,22 @@ If another AI assistant (Claude/Cline/Codex/etc.) takes over this repository, it
 - The same V1 network at 960×540 is **76.923 ms/frame (~13 FPS)**.
 - FP16 was slower than FP32 in the tested GTX 970 path.
 - V2 has **50,148 parameters**.
-- V2 model-only runtime benchmark is **35.625 ms/frame (~28.07 FPS)** on GTX 970 before training.
-- V2 smoke test and real-data 50-step validation both passed.
-- Official V2 5,000-step training is currently **in progress**.
+- V2 model-only runtime benchmark is **35.625 ms/frame (~28.07 FPS)** on GTX 970.
+- V2 5,000-step training completed successfully: **0.021147 total loss**, **0.86 step/s**, **5814.77 s**.
+- V2 quality validation: **32.5140 dB / 0.917668 SSIM** on 100 DIV2K validation images.
+- V2 is **0.2509 dB below V1** but dramatically faster.
+- ATMOS runtime environment audit passed; no video/capture backend is installed yet.
+- The next prototype will use an image sequence before adding a video/capture dependency.
 
 ### Immediate next decision
 
-**Do not start another training run while the current 5,000-step V2 run is in progress.**
+**Do not start another training run yet.** The trained V2 has now been validated for quality. The next priority is runtime engineering.
 
-After it completes:
-
-1. validate the V2 checkpoint;
-2. measure quality against bicubic and V1;
-3. benchmark trained V2 on GTX 970;
-4. then move toward the continuous frame-processing loop and real game test.
+1. benchmark the trained V2 on GTX 970;
+2. create the controlled image-sequence pipeline;
+3. measure end-to-end latency/FPS;
+4. add a real video/capture backend only after the controlled pipeline is verified;
+5. then move toward the real game test.
 
 The project path is now:
 
@@ -714,6 +805,10 @@ V2 5,000-step training
 quality validation
     ↓
 trained runtime benchmark
+    ↓
+controlled image-sequence pipeline
+    ↓
+video / capture backend
     ↓
 continuous frame pipeline
     ↓
