@@ -4,6 +4,8 @@ import argparse
 import random
 import time
 import zipfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,7 @@ from m3gss_v0.model import M3GSS_v0_32x8, count_parameters
 
 
 ROOT = Path(__file__).resolve().parent
+_THREAD_LOCAL = threading.local()
 
 DIV2K = Path(r"D:\M3GSS_OFFLINE\datasets\DIV2K\train_HR")
 FLICKR2K = Path(r"D:\M3GSS_OFFLINE\datasets\Flickr2K\HR\Flickr2K")
@@ -129,22 +132,63 @@ def make_training_pair(
     return bicubic_t, hr_t
 
 
+def _load_zip_image_threadsafe(source: tuple[Path, str]) -> np.ndarray:
+    zip_path, member = source
+    zf = getattr(_THREAD_LOCAL, "zip_file", None)
+    if zf is None:
+        zf = zipfile.ZipFile(zip_path, "r")
+        _THREAD_LOCAL.zip_file = zf
+    with zf.open(member) as fp:
+        with Image.open(fp) as img:
+            return np.asarray(img.convert("RGB"), dtype=np.uint8)
+
+
+def _make_sample(
+    path: Path | tuple[Path, str],
+    sample_seed: int,
+    zip_file: zipfile.ZipFile | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    image = (
+        _load_zip_image_threadsafe(path)
+        if isinstance(path, tuple)
+        else load_image(path, zip_file)
+    )
+    h, w = image.shape[:2]
+    if h < PATCH_SIZE or w < PATCH_SIZE:
+        raise ValueError(f"Image trop petite: {image.shape}")
+
+    sample_rng = random.Random(sample_seed)
+    x = sample_rng.randint(0, w - PATCH_SIZE)
+    y = sample_rng.randint(0, h - PATCH_SIZE)
+    hr = image[y:y + PATCH_SIZE, x:x + PATCH_SIZE]
+
+    lr = area_downscale(hr, PATCH_SIZE // SCALE, PATCH_SIZE // SCALE)
+    bicubic = catmull_rom_upscale(lr, PATCH_SIZE, PATCH_SIZE)
+
+    return (
+        torch.from_numpy(np.ascontiguousarray(bicubic)).permute(2, 0, 1).float() / 255.0,
+        torch.from_numpy(np.ascontiguousarray(hr)).permute(2, 0, 1).float() / 255.0,
+    )
+
+
 def make_batch(
     paths: list[Path | tuple[Path, str]],
     batch_size: int,
     rng: random.Random,
     zip_file: zipfile.ZipFile | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    inputs = []
-    targets = []
+    selected = [(paths[rng.randrange(len(paths))], rng.getrandbits(64)) for _ in range(batch_size)]
 
-    for _ in range(batch_size):
-        path = paths[rng.randrange(len(paths))]
-        image = load_image(path, zip_file)
-        inp, target = make_training_pair(image, rng)
-        inputs.append(inp)
-        targets.append(target)
+    if executor is not None:
+        results = list(executor.map(
+            lambda item: _make_sample(item[0], item[1], zip_file),
+            selected,
+        ))
+    else:
+        results = [_make_sample(path, seed, zip_file) for path, seed in selected]
 
+    inputs, targets = zip(*results)
     return torch.stack(inputs), torch.stack(targets)
 
 
@@ -339,11 +383,9 @@ def main() -> int:
     print("Demarrage...")
     print()
 
-    flickr_zip_file = (
-        zipfile.ZipFile(flickr2k_zip_path, "r")
-        if flickr2k_zip_path is not None
-        else None
-    )
+    flickr_zip_file = None
+    data_workers = min(8, args.batch_size)
+    data_executor = ThreadPoolExecutor(max_workers=data_workers)
 
     start = time.perf_counter()
     running_loss = 0.0
@@ -359,6 +401,7 @@ def main() -> int:
             args.batch_size,
             rng,
             flickr_zip_file,
+            data_executor,
         )
 
         bicubic = bicubic.to(device, non_blocking=True)
@@ -414,6 +457,7 @@ def main() -> int:
     final_charbonnier = running_charbonnier / loss_count
     final_edge = running_edge / loss_count
 
+    data_executor.shutdown(wait=True)
     if flickr_zip_file is not None:
         flickr_zip_file.close()
 
