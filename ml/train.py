@@ -12,6 +12,7 @@ from PIL import Image
 
 from m3gss_v0.bicubic import area_downscale, catmull_rom_upscale
 from m3gss_v0.model import M3GSS_v0_32x8, count_parameters
+from m3gss_v2.model import M3GSS_v2, count_parameters as count_parameters_v2
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,6 +23,9 @@ FLICKR2K = Path(r"D:\M3GSS_OFFLINE\datasets\Flickr2K\HR\Flickr2K")
 # Noms V1 : un run V1 ne doit jamais ecraser un checkpoint V0.
 DEFAULT_CHECKPOINT = ROOT / "checkpoints" / "m3gss_v1_big_latest.pt"
 DEFAULT_BEST = ROOT / "checkpoints" / "m3gss_v1_big_best.pt"
+DEFAULT_V2_CHECKPOINT = ROOT / "checkpoints" / "m3gss_v2_latest.pt"
+DEFAULT_V2_BEST = ROOT / "checkpoints" / "m3gss_v2_best.pt"
+DEFAULT_V2_SMOKE_CHECKPOINT = ROOT / "checkpoints" / "m3gss_v2_smoke.pt"
 
 PATCH_SIZE = 96
 SCALE = 2
@@ -131,6 +135,23 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def build_model(model_name: str) -> nn.Module:
+    """Construit explicitement V1 ou V2, sans changer le choix par defaut."""
+    if model_name == "v1":
+        return M3GSS_v0_32x8()
+    if model_name == "v2":
+        return M3GSS_v2()
+    raise ValueError(f"Modele inconnu : {model_name}")
+
+
+def count_model_parameters(model_name: str, model: nn.Module) -> int:
+    if model_name == "v1":
+        return count_parameters(model)
+    if model_name == "v2":
+        return count_parameters_v2(model)
+    raise ValueError(f"Modele inconnu : {model_name}")
+
+
 def load_image(path: Path) -> np.ndarray:
     with Image.open(path) as img:
         return np.asarray(img.convert("RGB"), dtype=np.uint8)
@@ -168,6 +189,34 @@ def make_training_pair(
     return bicubic_t, hr_t
 
 
+def make_training_pair_v2(
+    image: np.ndarray,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construit LR 48, baseline Catmull-Rom HR 96 et cible HR 96."""
+    h, w = image.shape[:2]
+    if h < PATCH_SIZE or w < PATCH_SIZE:
+        raise ValueError(f"Image trop petite: {image.shape}")
+
+    x = rng.randint(0, w - PATCH_SIZE)
+    y = rng.randint(0, h - PATCH_SIZE)
+    hr = image[y:y + PATCH_SIZE, x:x + PATCH_SIZE]
+
+    lr_size = PATCH_SIZE // SCALE
+    lr = area_downscale(hr, lr_size, lr_size)
+    baseline_hr = catmull_rom_upscale(lr, PATCH_SIZE, PATCH_SIZE)
+
+    def image_to_tensor(patch: np.ndarray) -> torch.Tensor:
+        return (
+            torch.from_numpy(np.ascontiguousarray(patch))
+            .permute(2, 0, 1)
+            .float()
+            .div(255.0)
+        )
+
+    return image_to_tensor(lr), image_to_tensor(baseline_hr), image_to_tensor(hr)
+
+
 def make_batch(
     paths: list[Path],
     batch_size: int,
@@ -190,6 +239,47 @@ def make_batch(
         targets.append(target)
 
     return torch.stack(inputs), torch.stack(targets)
+
+
+def make_batch_v2(
+    paths: list[Path],
+    batch_size: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lr_inputs = []
+    baselines = []
+    targets = []
+
+    for _ in range(batch_size):
+        path = paths[rng.randrange(len(paths))]
+        image = load_image(path)
+        lr, baseline_hr, target_hr = make_training_pair_v2(image, rng)
+        lr_inputs.append(lr)
+        baselines.append(baseline_hr)
+        targets.append(target_hr)
+
+    return torch.stack(lr_inputs), torch.stack(baselines), torch.stack(targets)
+
+
+def make_synthetic_batch_v2(
+    batch_size: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construit un batch V2 en memoire, sans dataset ni fichier image."""
+    from m3gss_v0.synthetic import make_synthetic_image
+
+    lr_inputs = []
+    baselines = []
+    targets = []
+    for _ in range(batch_size):
+        image_index = rng.randrange(10_000)
+        image = make_synthetic_image(image_index, size=PATCH_SIZE)
+        lr, baseline_hr, target_hr = make_training_pair_v2(image, rng)
+        lr_inputs.append(lr)
+        baselines.append(baseline_hr)
+        targets.append(target_hr)
+
+    return torch.stack(lr_inputs), torch.stack(baselines), torch.stack(targets)
 
 
 def save_checkpoint(
@@ -221,6 +311,77 @@ def save_checkpoint(
             "edge_weight": EDGE_WEIGHT,
         },
         path,
+    )
+
+
+PROTECTED_CHECKPOINT_PREFIXES = ("m3gss_v0_", "m3gss_v1_")
+
+
+def validate_v2_checkpoint_path(path: Path) -> None:
+    """Refuse les chemins V0/V1 et les fichiers existants non identifies V2."""
+    path = Path(path)
+    if path.name.casefold().startswith(PROTECTED_CHECKPOINT_PREFIXES):
+        raise ValueError(f"Chemin de checkpoint protege contre V2 : {path}")
+
+    if path.exists():
+        try:
+            existing = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise ValueError(
+                f"Refus d'ecraser un checkpoint existant non valide V2 : {path}"
+            ) from exc
+        if not isinstance(existing, dict) or existing.get("architecture") != "M3GSS_v2":
+            raise ValueError(
+                f"Refus d'ecraser un checkpoint qui n'est pas M3GSS_v2 : {path}"
+            )
+
+
+def save_v2_checkpoint(
+    path: Path,
+    model: M3GSS_v2,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+    loss: float,
+    seed: int,
+    dataset: str,
+) -> None:
+    validate_v2_checkpoint_path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "architecture": "M3GSS_v2",
+            "state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "step": step,
+            "loss": loss,
+            "seed": seed,
+            "scale": SCALE,
+            "patch_size_hr": PATCH_SIZE,
+            "patch_size_lr": PATCH_SIZE // SCALE,
+            "loss_version": LOSS_VERSION,
+            "num_parameters": count_parameters_v2(model),
+            "dataset": dataset,
+        },
+        path,
+    )
+
+
+def load_v2_checkpoint(
+    path: Path,
+    model: M3GSS_v2,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> tuple[int, float, int]:
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    if not isinstance(checkpoint, dict) or checkpoint.get("architecture") != "M3GSS_v2":
+        raise ValueError(f"Checkpoint refuse : architecture M3GSS_v2 requise ({path})")
+
+    model.load_state_dict(checkpoint["state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    return (
+        int(checkpoint["step"]),
+        float(checkpoint["loss"]),
+        int(checkpoint.get("seed", 1234)),
     )
 
 
@@ -261,7 +422,19 @@ def load_checkpoint(
 def main() -> int:
 
     parser = argparse.ArgumentParser(
-        description="M3GSS V1 - gros entrainement DIV2K + Flickr2K (Charbonnier + Edge)"
+        description="Entrainement M3GSS V1 ou V2 (Charbonnier + Edge)"
+    )
+
+    parser.add_argument(
+        "--model",
+        choices=("v1", "v2"),
+        default="v1",
+    )
+
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="V2 seulement : tres court test sur batches synthetiques en memoire",
     )
 
     parser.add_argument(
@@ -291,7 +464,7 @@ def main() -> int:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default=str(DEFAULT_CHECKPOINT),
+        default=None,
     )
 
     parser.add_argument(
@@ -301,50 +474,78 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if not DIV2K.exists():
-        raise FileNotFoundError(
-            f"Dataset DIV2K introuvable : {DIV2K}"
-        )
+    if args.smoke_test and args.model != "v2":
+        parser.error("--smoke-test est reserve a --model v2")
+    if args.smoke_test and args.resume:
+        parser.error("--resume ne peut pas etre combine avec --smoke-test")
+    if args.steps < 1 or args.batch_size < 1:
+        parser.error("--steps et --batch-size doivent etre positifs")
 
-    if not FLICKR2K.exists():
-        raise FileNotFoundError(
-            f"Dataset Flickr2K introuvable : {FLICKR2K}"
-        )
+    if args.checkpoint is None:
+        if args.smoke_test:
+            checkpoint = DEFAULT_V2_SMOKE_CHECKPOINT
+        elif args.model == "v2":
+            checkpoint = DEFAULT_V2_CHECKPOINT
+        else:
+            checkpoint = DEFAULT_CHECKPOINT
+    else:
+        checkpoint = Path(args.checkpoint)
 
-    div2k_paths = sorted(
-        DIV2K.rglob("*.png")
+    if args.model == "v2":
+        validate_v2_checkpoint_path(checkpoint)
+        if not args.smoke_test:
+            validate_v2_checkpoint_path(DEFAULT_V2_BEST)
+        if checkpoint.resolve() == DEFAULT_V2_BEST.resolve():
+            parser.error("--checkpoint doit etre distinct du checkpoint V2 best")
+
+    paths: list[Path] = []
+    dataset_name = "synthetic (generated in memory)" if args.smoke_test else (
+        "DIV2K_train_HR + Flickr2K_HR"
     )
 
-    flickr2k_paths = sorted(
-        FLICKR2K.rglob("*.png")
-    )
+    if not args.smoke_test:
+        if not DIV2K.exists():
+            raise FileNotFoundError(
+                f"Dataset DIV2K introuvable : {DIV2K}"
+            )
 
-    if not div2k_paths:
-        raise RuntimeError(
-            f"Aucune image PNG dans {DIV2K}"
-        )
+        if not FLICKR2K.exists():
+            raise FileNotFoundError(
+                f"Dataset Flickr2K introuvable : {FLICKR2K}"
+            )
 
-    if not flickr2k_paths:
-        raise RuntimeError(
-            f"Aucune image PNG dans {FLICKR2K}"
-        )
+        div2k_paths = sorted(DIV2K.rglob("*.png"))
+        flickr2k_paths = sorted(FLICKR2K.rglob("*.png"))
 
-    paths = div2k_paths + flickr2k_paths
+        if not div2k_paths:
+            raise RuntimeError(f"Aucune image PNG dans {DIV2K}")
 
-    if not torch.cuda.is_available():
+        if not flickr2k_paths:
+            raise RuntimeError(f"Aucune image PNG dans {FLICKR2K}")
+
+        paths = div2k_paths + flickr2k_paths
+
+    if not torch.cuda.is_available() and not args.smoke_test:
         raise RuntimeError(
             "CUDA n'est pas disponible."
         )
 
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("=== M3GSS V1 - GROS ENTRAINEMENT ===")
+    print(f"=== M3GSS {args.model.upper()} - ENTRAINEMENT ===")
     print()
-    print(f"DIV2K images    : {len(div2k_paths)}")
-    print(f"Flickr2K images : {len(flickr2k_paths)}")
-    print(f"Total images    : {len(paths)}")
+    if args.smoke_test:
+        print("Dataset         : synthetique (en memoire)")
+    else:
+        print(f"DIV2K images    : {len(div2k_paths)}")
+        print(f"Flickr2K images : {len(flickr2k_paths)}")
+        print(f"Total images    : {len(paths)}")
     print()
-    print(f"GPU             : {torch.cuda.get_device_name(0)}")
+    print(
+        f"GPU             : {torch.cuda.get_device_name(0)}"
+        if device.type == "cuda"
+        else "GPU             : indisponible (smoke test CPU)"
+    )
     print(f"PyTorch         : {torch.__version__}")
     print(f"CUDA            : {torch.version.cuda}")
     print(f"Patch HR        : {PATCH_SIZE}x{PATCH_SIZE}")
@@ -360,7 +561,7 @@ def main() -> int:
     print(f"Edge weight     : {EDGE_WEIGHT}")
     print()
 
-    model = M3GSS_v0_32x8().to(device)
+    model = build_model(args.model).to(device)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -372,27 +573,30 @@ def main() -> int:
     start_step = 0
     resume_seed = args.seed
 
-    checkpoint = Path(args.checkpoint)
-
     if args.resume:
         if not checkpoint.exists():
             raise FileNotFoundError(
                 f"Checkpoint introuvable : {checkpoint}"
             )
 
-        start_step, _, resume_seed = load_checkpoint(
-            checkpoint,
-            model,
-            optimizer,
-            device,
-        )
+        if args.model == "v2":
+            start_step, _, resume_seed = load_v2_checkpoint(
+                checkpoint, model, optimizer, device
+            )
+        else:
+            start_step, _, resume_seed = load_checkpoint(
+                checkpoint,
+                model,
+                optimizer,
+                device,
+            )
 
         rng = random.Random(resume_seed)
 
     else:
         rng = random.Random(args.seed)
 
-    print(f"Parametres      : {count_parameters(model):,}")
+    print(f"Parametres      : {count_model_parameters(args.model, model):,}")
     print(
         f"Debut effectif  : "
         f"{start_step + 1}"
@@ -419,16 +623,17 @@ def main() -> int:
         args.steps + 1,
     ):
 
-        bicubic, target = make_batch(
-            paths,
-            args.batch_size,
-            rng,
-        )
-
-        bicubic = bicubic.to(
-            device,
-            non_blocking=True,
-        )
+        if args.model == "v1":
+            model_input, target = make_batch(paths, args.batch_size, rng)
+            model_input = model_input.to(device, non_blocking=True)
+        elif args.smoke_test:
+            lr_input, bicubic, target = make_synthetic_batch_v2(args.batch_size, rng)
+            lr_input = lr_input.to(device, non_blocking=True)
+            bicubic = bicubic.to(device, non_blocking=True)
+        else:
+            lr_input, bicubic, target = make_batch_v2(paths, args.batch_size, rng)
+            lr_input = lr_input.to(device, non_blocking=True)
+            bicubic = bicubic.to(device, non_blocking=True)
 
         target = target.to(
             device,
@@ -439,7 +644,10 @@ def main() -> int:
             set_to_none=True
         )
 
-        output = model(bicubic)
+        if args.model == "v1":
+            output = model(model_input)
+        else:
+            output = model(lr_input, bicubic)
 
         loss, charbonnier_t, edge_t = criterion(
             output,
@@ -498,14 +706,25 @@ def main() -> int:
                 running_loss / loss_count
             )
 
-            save_checkpoint(
-                checkpoint,
-                model,
-                optimizer,
-                step,
-                checkpoint_loss,
-                resume_seed,
-            )
+            if args.model == "v2":
+                save_v2_checkpoint(
+                    checkpoint,
+                    model,
+                    optimizer,
+                    step,
+                    checkpoint_loss,
+                    resume_seed,
+                    dataset_name,
+                )
+            else:
+                save_checkpoint(
+                    checkpoint,
+                    model,
+                    optimizer,
+                    step,
+                    checkpoint_loss,
+                    resume_seed,
+                )
 
             print(
                 f"  -> checkpoint sauvegarde : "
@@ -529,39 +748,58 @@ def main() -> int:
         running_edge / loss_count
     )
 
-    save_checkpoint(
-        checkpoint,
-        model,
-        optimizer,
-        args.steps,
-        final_loss,
-        resume_seed,
-    )
-
-    best_path = Path(
-        DEFAULT_BEST
-    )
-
-    torch.save(
-        {
-            "state_dict": model.state_dict(),
-            "step": args.steps,
-            "loss": final_loss,
-            "patch_size": PATCH_SIZE,
-            "scale": SCALE,
-            "dataset": "DIV2K_train_HR + Flickr2K_HR",
-            "loss_version": LOSS_VERSION,
-        },
-        best_path,
-    )
+    if args.model == "v2":
+        save_v2_checkpoint(
+            checkpoint,
+            model,
+            optimizer,
+            args.steps,
+            final_loss,
+            resume_seed,
+            dataset_name,
+        )
+        if not args.smoke_test:
+            save_v2_checkpoint(
+                DEFAULT_V2_BEST,
+                model,
+                optimizer,
+                args.steps,
+                final_loss,
+                resume_seed,
+                dataset_name,
+            )
+        best_path = None if args.smoke_test else DEFAULT_V2_BEST
+    else:
+        save_checkpoint(
+            checkpoint,
+            model,
+            optimizer,
+            args.steps,
+            final_loss,
+            resume_seed,
+        )
+        best_path = Path(DEFAULT_BEST)
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "step": args.steps,
+                "loss": final_loss,
+                "patch_size": PATCH_SIZE,
+                "scale": SCALE,
+                "dataset": "DIV2K_train_HR + Flickr2K_HR",
+                "loss_version": LOSS_VERSION,
+            },
+            best_path,
+        )
 
     peak_vram = (
-        torch.cuda.max_memory_allocated()
-        / (1024 ** 2)
+        torch.cuda.max_memory_allocated() / (1024 ** 2)
+        if device.type == "cuda"
+        else 0.0
     )
 
     print()
-    print("=== GROS ENTRAINEMENT TERMINE ===")
+    print(f"=== ENTRAINEMENT M3GSS {args.model.upper()} TERMINE ===")
     print(f"Charbonnier    : {final_charbonnier:.6f}")
     print(f"Edge/Gradient  : {final_edge:.6f}")
     print(f"Loss totale    : {final_loss:.6f}")
@@ -572,7 +810,10 @@ def main() -> int:
     )
     print(f"VRAM max     : {peak_vram:.1f} MiB")
     print(f"Checkpoint   : {checkpoint}")
-    print(f"Modele final : {best_path}")
+    if best_path is not None:
+        print(f"Modele final : {best_path}")
+    if args.smoke_test:
+        print("Mode smoke test : aucun checkpoint best V2 n'a ete modifie")
 
     return 0
 
