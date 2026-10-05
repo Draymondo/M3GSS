@@ -61,18 +61,6 @@ Used mainly for:
 
 Some models/checkpoints and local resources exist only on ATMOS and are not necessarily present on the T470s.
 
-### Kaggle
-
-Additional training/experimentation environment:
-
-- Tesla T4
-- ~14.5 GB VRAM
-- PyTorch 2.11.0+cu128
-- CUDA 12.8
-- Internet enabled
-
-Kaggle is useful for experiments, but **it is not the final target**. The final target remains the GTX 970 on ATMOS.
-
 ---
 
 ## 3. Dataset
@@ -294,86 +282,231 @@ Conclusion: **do not assume FP16 is an optimization on this GTX 970**. The teste
 
 ---
 
-## 8. Architectural conclusion — V2 direction
+## 8. V2 — low-resolution runtime architecture
 
-The runtime measurements establish that the principal issue is **where the convolutions are performed**, not the bicubic operation.
+The measured V1 bottleneck led to a concrete V2 design.
 
-Current architecture:
+### Selected architecture
 
 ```
-960×540
-   ↓
-Bicubic ×2                    ~2.8 ms
-   ↓
+960×540 LR
+      ↓
+Conv 3→24
+      ↓
+4 residual blocks, 24 channels
+      ↓
+trunk Conv 24→24
+      ↓
+Conv 24→12
+      ↓
+PixelShuffle ×2
+      ↓
+3-channel HR residual
+      +
+Catmull-Rom HR baseline
+      ↓
 1920×1080
-   ↓
-8 residual blocks + trunk     ~311.7 ms
-   ↓
-1920×1080
 ```
 
-This is the wrong computational layout for the final GTX 970 target.
+Key constraints:
 
-### Intended V2 direction
+- majority of learned computation stays at **960×540**;
+- **no BatchNorm**;
+- **no heavy attention**;
+- actual learned **×2 reconstruction**;
+- explicit Catmull-Rom HR baseline;
+- final reconstruction layer is **zero initialized**, so an untrained V2 initially reproduces the baseline exactly;
+- V1 remains the quality reference;
+- V2 reuses the validated Charbonnier + Edge loss;
+- target hardware remains GTX 970 4 GB;
+- FP16 is not assumed to help.
 
-The next architecture should perform the **majority of learned computation in low-resolution feature space**, then reconstruct/upscale to 1920×1080 near the end:
+### V2 prototype validation
 
-```
-960×540 game frame
-       ↓
-low-resolution feature extraction
-       ↓
-most residual processing at 960×540
-       ↓
-efficient ×2 reconstruction / upsampling head
-       ↓
-1920×1080 output
-```
+File:
 
-This is now the **preferred V2 design direction**.
+`ml/m3gss_v2/model.py`
 
-Important:
+Prototype characteristics:
 
-- do not simply add more training to V1;
-- do not start V1.5 automatically before runtime architecture work;
-- preserve V1 as the **quality and correctness reference**;
-- V2 must be benchmarked first, then trained if its runtime profile is promising;
-- the objective is to move from an offline reconstruction model toward a **real-time game-capable component on GTX 970**.
+- **50,148 parameters**
+- input: LR `[N,3,H,W]`
+- baseline: HR `[N,3,2H,2W]`
+- output: HR `[N,3,2H,2W]`
+- PixelShuffle ×2
+- zero-initialized reconstruction head
+- forward/backward self-test passed
+- output initially equals the Catmull-Rom baseline exactly.
 
-The exact V2 layer count, channel count and upsampling mechanism should be chosen after designing a lightweight prototype and benchmarking it, rather than guessed in advance.
+### V2 GTX 970 runtime benchmark
+
+ATMOS / GTX 970, FP32:
+
+- LR: 960×540
+- HR: 1920×1080
+- 20 warm-up iterations
+- 100 measurement iterations
+- mean latency: **35.625 ms/frame**
+- theoretical FPS: **28.07**
+- min CUDA: 34.801 ms
+- max CUDA: 36.176 ms
+- peak allocated VRAM: **246.5 MiB**
+- V1 reference: 311.2 ms/frame / 3.21 FPS
+- V2 speedup: **8.74×**
+- latency reduction: **88.55%**
+
+Important qualification:
+
+> 28.07 FPS is a **model-only benchmark**, not final game FPS. V2 was untrained during this measurement, and its zero-initialized reconstruction head therefore behaved essentially as the Catmull-Rom baseline.
+
+The result nevertheless validates the V2 architecture as a strong runtime direction. The architecture should not be reduced further before training/quality evaluation.
 
 ---
 
-## 9. V1.5 — currently deprioritized
+## 9. V2 training integration and validation
 
-A controlled `EDGE_WEIGHT = 0.05` experiment was originally planned.
+V2 was integrated into `ml/train.py` without changing the V1 default path.
 
-It is **not currently the next priority**.
+Supported selector:
 
-Reason: runtime benchmarking demonstrated a much more important limitation in the existing architecture. The project should first establish a viable low-resolution runtime architecture.
+`--model {v1,v2}`
 
-V1.5 can still be performed later if the result is useful for quality comparison.
+Important V2 training properties:
+
+- HR patches: **96×96**
+- LR patches: **48×48**
+- ×2 scale
+- existing `area_downscale`
+- existing `catmull_rom_upscale`
+- V2 receives LR + Catmull-Rom HR baseline
+- target remains HR
+- loss: **Charbonnier + Edge**
+- `CHARBONNIER_EPS = 0.001`
+- `EDGE_WEIGHT = 0.1`
+- `LOSS_VERSION = "v1_charbonnier_edge"`
+- V2 checkpoints:
+  - `m3gss_v2_latest.pt`
+  - `m3gss_v2_best.pt`
+- V2 checkpoint metadata records architecture, scale, patch sizes, loss version, parameter count, dataset, step and optimizer state.
+- checkpoint loader rejects wrong architecture.
+- V2 save paths are separated from V0/V1 paths.
+- V1 checkpoint save/round-trip behavior was preserved.
+
+Validation before training:
+
+- V2 training tests: **5 passed**
+- targeted suite: **38 passed**
+- AST/syntax validation: OK
+- `train.py --help`: V1/V2 selector and smoke-test exposed
+- no V0/V1 checkpoint modification.
+
+### V2 smoke test
+
+Command:
+
+```powershell
+D:\M3GSS_OFFLINE\m3gss_gpu_env\Scripts\python.exe .\ml\train.py --model v2 --smoke-test --steps 3 --batch-size 1
+```
+
+Result:
+
+- **3/3 steps passed**
+- V2 forward/backward: OK
+- optimizer step: OK
+- Charbonnier + Edge: OK
+- total time: **0.57 s**
+- speed: **5.28 step/s**
+- checkpoint created: `m3gss_v2_smoke.pt`
+
+### Real-data 50-step validation
+
+Command:
+
+```powershell
+D:\M3GSS_OFFLINE\m3gss_gpu_env\Scripts\python.exe .\ml\train.py --model v2 --steps 50 --batch-size 1
+```
+
+The terminal output was only captured through step 25, but checkpoint inspection confirmed the run **did reach step 50**.
+
+Checkpoint metadata from `m3gss_v2_latest.pt`:
+
+- step: **50**
+- loss: **0.020713699739426373**
+- architecture: **M3GSS_v2**
+- loss version: **v1_charbonnier_edge**
+- parameters: **50,148**
+- HR patch: **96**
+- LR patch: **48**
+- scale: **2**
+- dataset: **DIV2K_train_HR + Flickr2K_HR**
+
+This confirmed that V2 training works on the **real 3,450-image dataset** and that checkpointing reaches the requested step.
 
 ---
 
-## 10. Current project priority
+## 10. Official V2 5,000-step training — IN PROGRESS
+
+The first full V2 training run has now been launched manually on ATMOS, rather than by Copilot.
+
+Command:
+
+```powershell
+D:\M3GSS_OFFLINE\m3gss_gpu_env\Scripts\python.exe C:\M3GSS\ml\train.py --model v2 --steps 5000 --batch-size 8
+```
+
+At launch, the run confirmed:
+
+- DIV2K: **800 images**
+- Flickr2K: **2,650 images**
+- total: **3,450 images**
+- GPU: **NVIDIA GeForce GTX 970**
+- PyTorch: **2.14.1+cu126**
+- CUDA: **12.6**
+- HR patch: **96×96**
+- LR patch: **48×48**
+- steps: **5,000**
+- batch: **8**
+- learning rate: **1e-4**
+- loss: **v1_charbonnier_edge**
+- Charbonnier eps: **0.001**
+- Edge weight: **0.1**
+- parameters: **50,148**
+- effective start: **1**
+- requested end: **5,000**
+
+Observed early training:
+
+| Step | Charbonnier | Edge | Total | Reported speed |
+|---:|---:|---:|---:|---:|
+| 1 | 0.016584 | 0.035944 | 0.020178 | 0.77 step/s |
+| 25 | 0.011006 | 0.024497 | 0.013456 | 0.84 step/s |
+
+**Status: RUNNING / IN PROGRESS.**
+
+The machine can remain offline during this training because the dataset, code and Python environment are local on ATMOS.
+
+Do not treat the final V2 quality or runtime as established until the 5,000-step run completes and the trained checkpoint is validated.
+
+---
+
+## 11. Current project priority
 
 The project is now explicitly in this order:
 
-1. **Design M3GSS V2 for low-resolution computation.**
-2. Build a minimal V2 prototype.
-3. Benchmark V2 latency/FPS on the GTX 970.
-4. Compare V2 output quality against bicubic and V1.
-5. Only then train V2 seriously if the runtime/quality tradeoff is promising.
-6. Build a continuous frame-processing loop.
-7. Introduce a real game/frame source.
-8. Test actual playable game performance on ATMOS.
+1. **Complete the official V2 5,000-step training run.**
+2. Validate the trained V2 checkpoint.
+3. Measure V2 quality against bicubic and V1.
+4. Re-run the GTX 970 runtime benchmark with the trained V2.
+5. Build a continuous frame-processing loop.
+6. Introduce a real game/frame source.
+7. Test actual playable game performance on ATMOS.
+8. Only then iterate further on architecture or temporal reconstruction.
 
 The project must **not** drift into an endless training cycle.
 
 ---
 
-## 11. Dataset / training history
+## 12. Dataset / training history
 
 The official completed spatial benchmarks use:
 
@@ -396,13 +529,21 @@ official V0
 official V1 loss experiment
         ↓
 GTX 970 runtime investigation
+        ↓
+V2 low-resolution architecture
+        ↓
+V2 runtime benchmark
+        ↓
+V2 training integration
+        ↓
+V2 smoke + real-data validation
+        ↓
+official V2 5,000-step training — IN PROGRESS
 ```
-
-There was also an incomplete Kaggle 5,000-step experiment after a session reset. It is not an official completed result.
 
 ---
 
-## 12. Checkpoints
+## 13. Checkpoints
 
 Important local ATMOS checkpoints:
 
@@ -411,19 +552,22 @@ Important local ATMOS checkpoints:
 - `ml/checkpoints/m3gss_v0_div2k_500.pt`
 - `ml/checkpoints/m3gss_v1_big_best.pt`
 - `ml/checkpoints/m3gss_v1_big_latest.pt`
+- `ml/checkpoints/m3gss_v2_smoke.pt`
+- `ml/checkpoints/m3gss_v2_latest.pt`
+- `ml/checkpoints/m3gss_v2_best.pt`
 - `ml/checkpoints/smoke_test.pt`
 
-The official V1 best checkpoint is:
+Current V2 real-data validation checkpoint:
 
-`ml/checkpoints/m3gss_v1_big_best.pt`
+`ml/checkpoints/m3gss_v2_latest.pt`
 
-It contains the trained 158,979-parameter architecture used for the runtime benchmarks.
+It was verified to contain **step 50**.
 
 Checkpoints are not committed to Git.
 
 ---
 
-## 13. Current C++ prototype
+## 14. Current C++ prototype
 
 The repository also contains an earlier C++17/CMake prototype.
 
@@ -455,7 +599,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 ---
 
-## 14. Runtime scripts
+## 15. Runtime scripts
 
 The following experimental runtime scripts now exist in `ml/`:
 
@@ -463,12 +607,13 @@ The following experimental runtime scripts now exist in `ml/`:
 - `benchmark_fp16.py` — FP16 vs FP32 experiment
 - `benchmark_resolutions.py` — multi-resolution latency benchmark
 - `benchmark_runtime_breakdown.py` — bicubic/network runtime decomposition
+- `benchmark_v2_runtime.py` — GTX 970 V2 architecture benchmark
 
 These are measurement tools, not yet the final game runtime.
 
 ---
 
-## 15. Longer-term roadmap
+## 16. Longer-term roadmap
 
 ### V0 — Spatial baseline
 **Completed.**
@@ -477,7 +622,7 @@ These are measurement tools, not yet the final game runtime.
 **Completed.**
 
 ### V2 — Low-resolution runtime architecture
-**Next priority.**
+**Architecture validated; 5,000-step training currently in progress.**
 
 Primary objective:
 
@@ -497,7 +642,7 @@ Temporal reconstruction using previous-frame history, motion vectors and potenti
 
 ---
 
-## 16. Design principles / constraints
+## 17. Design principles / constraints
 
 M3GSS should remain:
 
@@ -522,7 +667,7 @@ Do not lose the main objective:
 
 ---
 
-## 17. Handoff for another AI agent
+## 18. Handoff for another AI agent
 
 If another AI assistant (Claude/Cline/Codex/etc.) takes over this repository, it should read this README **before making project decisions**.
 
@@ -535,20 +680,21 @@ If another AI assistant (Claude/Cline/Codex/etc.) takes over this repository, it
 - The bicubic portion of the target pipeline is only **2.813 ms**.
 - The same V1 network at 960×540 is **76.923 ms/frame (~13 FPS)**.
 - FP16 was slower than FP32 in the tested GTX 970 path.
-- Therefore the major bottleneck is the **full-resolution neural computation**.
+- V2 has **50,148 parameters**.
+- V2 model-only runtime benchmark is **35.625 ms/frame (~28.07 FPS)** on GTX 970 before training.
+- V2 smoke test and real-data 50-step validation both passed.
+- Official V2 5,000-step training is currently **in progress**.
 
 ### Immediate next decision
 
-Do **not** automatically:
+**Do not start another training run while the current 5,000-step V2 run is in progress.**
 
-- launch another long training run;
-- start V1.5;
-- optimize bicubic;
-- assume FP16 will solve the problem.
+After it completes:
 
-Instead:
-
-> **Design and benchmark a V2 architecture that performs most learned computation at 960×540 and performs ×2 reconstruction near the output stage.**
+1. validate the V2 checkpoint;
+2. measure quality against bicubic and V1;
+3. benchmark trained V2 on GTX 970;
+4. then move toward the continuous frame-processing loop and real game test.
 
 The project path is now:
 
@@ -561,9 +707,13 @@ low-resolution V2 prototype
     ↓
 GTX 970 benchmark
     ↓
-quality comparison
+training integration
     ↓
-training
+V2 5,000-step training
+    ↓
+quality validation
+    ↓
+trained runtime benchmark
     ↓
 continuous frame pipeline
     ↓
